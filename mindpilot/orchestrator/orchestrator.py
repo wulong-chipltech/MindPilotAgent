@@ -69,9 +69,9 @@ class MindPilotOrchestrator:
             verbose=self.config.verbose,
         )
         self.bus = MessageBus()
-        # 改进④：HumanInTheLoop 由配置驱动
+        # 改进④：HumanInTheLoop 由配置驱动（字段定义在 config.py MindPilotConfig 中）
         self.human_loop = HumanInTheLoop(
-            enabled=getattr(self.config, "human_in_the_loop", False)
+            enabled=self.config.human_in_the_loop
         )
 
         self.llm    = LLMClient(self.config)
@@ -181,6 +181,29 @@ class MindPilotOrchestrator:
             except Exception:
                 pass
 
+        # ── 审核点 1：规划方案人工审核 ────────────────────────
+        if self.human_loop.enabled:
+            review = self.human_loop.review_plan(plan)
+            if review["action"] == "abort":
+                self.logger.info("Orchestrator", "User aborted at plan review")
+                return self._make_abort_result(query, start_time, "User aborted at plan review")
+            if review["action"] == "select_path" and review.get("path"):
+                # 用户选择了不同路径，重新分解任务
+                self.logger.info("Orchestrator",
+                    f"User selected path: {review['path'][:50]}")
+                new_tasks, new_reasoning = self.planner.react.decompose(
+                    query, review["path"])
+                new_tasks, _ = self.planner._validate_dag(new_tasks)
+                plan.tasks = new_tasks
+                plan.reasoning = new_reasoning
+                plan.selected_path = review["path"]
+                self.planner.print_plan(plan)
+            if review["action"] == "skip_tasks" and review.get("skip_ids"):
+                skip_ids = set(review["skip_ids"])
+                plan.tasks = [t for t in plan.tasks if t.task_id not in skip_ids]
+                self.logger.info("Orchestrator",
+                    f"User skipped tasks: {skip_ids}")
+
         # 辅助函数：从计划中提取某个 Agent 的任务描述
         def _task_desc(agent_name: str, default: str) -> str:
             t = next((t for t in plan.tasks if t.agent == agent_name), None)
@@ -230,6 +253,19 @@ class MindPilotOrchestrator:
 
         self._print_exp_design(exp_design)
 
+        # ── 审核点 2：实验设计人工审核 ────────────────────────
+        if self.human_loop.enabled:
+            review = self.human_loop.review_experiment(query, exp_design)
+            if review["action"] == "abort":
+                self.logger.info("Orchestrator", "User aborted at experiment review")
+                return self._make_abort_result(query, start_time, "User aborted at experiment review")
+            if review["action"] == "modify" and review.get("modifications"):
+                for key, val in review["modifications"].items():
+                    exp_design[key] = val
+                self.logger.info("Orchestrator",
+                    f"User modified experiment: {list(review['modifications'].keys())}")
+                self._print_exp_design(exp_design)
+
         # ── Step 4: 代码实现 ──────────────────────────────────
         self.logger.info("Orchestrator", "【Step 4/6】 代码生成与自动调试...")
         code_desc = _task_desc("CodeAgent", f"为「{query}」实现核心算法")
@@ -251,20 +287,45 @@ class MindPilotOrchestrator:
             code_fallback,
         )
 
+        # ── 审核点 3：代码执行结果人工审核 ────────────────────
+        _skip_analysis = False
+        if self.human_loop.enabled:
+            review = self.human_loop.review_code(code_result)
+            if review["action"] == "abort":
+                self.logger.info("Orchestrator", "User aborted at code review")
+                return self._make_abort_result(query, start_time, "User aborted at code review")
+            if review["action"] == "retry":
+                self.logger.info("Orchestrator", "User requested code retry")
+                code_result = self._run_step(
+                    "code",
+                    lambda: self.code_agent.run(code_desc, context=context),
+                    code_fallback,
+                )
+            if review["action"] == "skip":
+                self.logger.info("Orchestrator", "User skipped analysis step")
+                _skip_analysis = True
+
         # ── Step 5: 数据分析 ──────────────────────────────────
-        self.logger.info("Orchestrator", "【Step 5/6】 数据分析与可视化...")
-        ana_desc = _task_desc("AnalysisAgent", f"分析「{query}」的实验结果")
-        code_stdout = code_result.get("stdout", "")
-        analysis_fallback = {
-            "conclusion": "数据分析未完成，代码执行结果为空或分析失败",
-            "charts": [],
-            "_fallback": True,
-        }
-        analysis_result = self._run_step(
-            "analysis",
-            lambda: self.analysis_agent.run(ana_desc, code_output=code_stdout),
-            analysis_fallback,
-        )
+        if _skip_analysis:
+            analysis_result = {
+                "conclusion": "Analysis skipped by user",
+                "charts": [],
+                "_skipped": True,
+            }
+        else:
+            self.logger.info("Orchestrator", "【Step 5/6】 数据分析与可视化...")
+            ana_desc = _task_desc("AnalysisAgent", f"分析「{query}」的实验结果")
+            code_stdout = code_result.get("stdout", "")
+            analysis_fallback = {
+                "conclusion": "数据分析未完成，代码执行结果为空或分析失败",
+                "charts": [],
+                "_fallback": True,
+            }
+            analysis_result = self._run_step(
+                "analysis",
+                lambda: self.analysis_agent.run(ana_desc, code_output=code_stdout),
+                analysis_fallback,
+            )
 
         # ── Step 6: 评估反思 + 报告生成 ──────────────────────
         self.logger.info("Orchestrator", "【Step 6/6】 评估反思与报告生成（Word/MD/HTML）...")
@@ -328,26 +389,50 @@ class MindPilotOrchestrator:
         return final_result
 
     def _print_exp_design(self, exp: dict):
-        print(f"\n{'━'*60}")
-        print(f"  🔬 实验设计方案{'  [降级]' if exp.get('_fallback') else ''}")
-        print(f"{'━'*60}")
+        print(f"\n{'='*60}")
+        print(f"  Experiment Design{'  [DEGRADED]' if exp.get('_fallback') else ''}")
+        print(f"{'='*60}")
         hyp = exp.get("research_hypothesis", "")
         if hyp:
-            print(f"  假设: {hyp[:70]}")
+            print(f"  Hypothesis: {hyp[:70]}")
         baselines = exp.get("baselines", [])
         if baselines:
-            print(f"  对照: {' | '.join(str(b)[:25] for b in baselines[:3])}")
+            print(f"  Baselines:  {' | '.join(str(b)[:25] for b in baselines[:3])}")
         metrics = exp.get("metrics", [])
         if metrics:
-            print(f"  指标: {' | '.join(str(m)[:20] for m in metrics[:3])}")
+            print(f"  Metrics:    {' | '.join(str(m)[:20] for m in metrics[:3])}")
         desc = exp.get("full_description", "")
         if desc:
-            print(f"  描述: {desc[:80]}...")
-        print(f"{'━'*60}\n")
+            print(f"  Description: {desc[:80]}...")
+        print(f"{'='*60}\n")
+
+    def _make_abort_result(self, query: str, start_time: float, reason: str) -> dict:
+        """Generate a result dict when user aborts the run via Human-in-the-Loop."""
+        self.memory.save_long_term()
+        self.logger.save_summary()
+        total_time = round(time.time() - start_time, 2)
+        print(f"\n  [ABORTED] {reason}")
+        print(f"  Elapsed: {total_time}s\n")
+        return {
+            "query":        query,
+            "session_id":   self.session_id,
+            "aborted":      True,
+            "abort_reason":  reason,
+            "plan":         {},
+            "literature":   {},
+            "experiment":   {},
+            "code":         {},
+            "analysis":     {},
+            "evaluation":   {},
+            "report_files": {},
+            "total_time_s": total_time,
+            "session_log":  str(self.logger.log_file),
+            "human_decisions": self.human_loop.decisions if self.human_loop.enabled else [],
+        }
 
     def _print_banner(self):
         mode = "Mock 模式" if self.config.mock_mode else f"API [{self.config.llm.model}]"
-        hitl = "开启" if getattr(self.config, "human_in_the_loop", False) else "关闭"
+        hitl = "开启" if self.config.human_in_the_loop else "关闭"
         print(f"""
 ╔══════════════════════════════════════════════════════╗
 ║         MindPilot  多模态智能科研助手 Agent           ║

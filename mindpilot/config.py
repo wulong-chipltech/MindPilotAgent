@@ -116,6 +116,12 @@ class MindPilotConfig:
     memory_dir: str = "memory/store"
     mock_mode: bool = field(default_factory=_is_mock)
     verbose: bool = True
+    # 改进④：HumanInTheLoop 由配置驱动，而非 hardcode
+    # 设为 True 时，关键步骤（如代码执行、实验设计）会暂停等待用户确认
+    # 通过环境变量 HUMAN_IN_THE_LOOP=true 开启
+    human_in_the_loop: bool = field(
+        default_factory=lambda: os.getenv("HUMAN_IN_THE_LOOP", "").lower() in ("true", "1", "yes")
+    )
 
 
 CONFIG = MindPilotConfig()
