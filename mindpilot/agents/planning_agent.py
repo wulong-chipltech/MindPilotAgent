@@ -291,12 +291,13 @@ class PlanningAgent:
                 self.logger.info(self.AGENT_NAME, f"记忆检索：找到 {len(similar)} 条相关历史记录")
                 snippets = []
                 for item in similar[:3]:          # 最多取 3 条，避免 prompt 过长
-                    payload = item.get("payload", {})
+                    # item 是 MemoryEntry 对象（dataclass），用属性访问而非 .get()
+                    payload = item.payload if hasattr(item, "payload") else {}
                     if isinstance(payload, dict) and "tasks" in payload:
                         task_names = [t.get("name", "") for t in payload["tasks"]]
                         snippets.append(
                             f"- 历史问题：{payload.get('query', '')[:60]}\n"
-                            f"  任务结构：{' → '.join(task_names)}"
+                            f"  任务结构：{' -> '.join(task_names)}"
                         )
                 memory_context = "\n".join(snippets)
 
